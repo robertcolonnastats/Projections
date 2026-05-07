@@ -21,30 +21,33 @@ def fetch_remaining_schedule(from_date: date | None = None) -> pd.DataFrame:
 
     end_date = date.fromisoformat(WORLD_SERIES_END_APPROX)
     if from_date > end_date:
-        return pd.DataFrame(columns=["game_id", "game_date", "home_team_id", "away_team_id"])
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team_id", "away_team_id", "status"])
 
-    # MLB API limits schedule requests; chunk by month to be safe
     all_games = []
     chunk_start = from_date
 
     while chunk_start <= end_date:
-        chunk_end = min(
-            date(chunk_start.year, chunk_start.month, 1) + timedelta(days=31),
-            end_date
-        )
-        # Snap to month end
-        if chunk_end.month != chunk_start.month:
+        # Build chunk end = last day of current month
+        if chunk_start.month == 12:
+            chunk_end = date(chunk_start.year, 12, 31)
+        else:
             chunk_end = date(chunk_start.year, chunk_start.month + 1, 1) - timedelta(days=1)
+        chunk_end = min(chunk_end, end_date)
 
         games = _fetch_schedule_chunk(chunk_start, chunk_end)
         all_games.extend(games)
         chunk_start = chunk_end + timedelta(days=1)
 
     if not all_games:
-        return pd.DataFrame(columns=["game_id", "game_date", "home_team_id", "away_team_id"])
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team_id", "away_team_id", "status"])
 
     df = pd.DataFrame(all_games)
     df["game_date"] = pd.to_datetime(df["game_date"])
+
+    # Ensure status column always exists
+    if "status" not in df.columns:
+        df["status"] = ""
+
     df = df.drop_duplicates(subset="game_id")
     return df.sort_values("game_date").reset_index(drop=True)
 
@@ -56,7 +59,7 @@ def _fetch_schedule_chunk(start: date, end: date) -> list[dict]:
         "sportId": 1,
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "gameType": "R",          # regular season only
+        "gameType": "R",
         "hydrate": "team",
         "season": SEASON_YEAR,
     }
@@ -72,50 +75,63 @@ def _fetch_schedule_chunk(start: date, end: date) -> list[dict]:
     games = []
     for date_entry in data.get("dates", []):
         for game in date_entry.get("games", []):
-            status = game.get("status", {}).get("abstractGameState", "")
-            # Only include scheduled / in-progress / final
+            # abstractGameState: "Preview", "Live", "Final"
+            status = ""
+            status_obj = game.get("status")
+            if isinstance(status_obj, dict):
+                status = status_obj.get("abstractGameState", "") or ""
+
             home_id = game.get("teams", {}).get("home", {}).get("team", {}).get("id")
             away_id = game.get("teams", {}).get("away", {}).get("team", {}).get("id")
+
             if home_id and away_id:
-                # Also capture detailed state for filtering
-                detail_state = game.get("status", {}).get("detailedState", "")
                 games.append({
                     "game_id":      game.get("gamePk"),
                     "game_date":    date_entry.get("date"),
-                    "home_team_id": home_id,
-                    "away_team_id": away_id,
-                    "status":       status or "",
-                    "detail_state": detail_state or "",
+                    "home_team_id": int(home_id),
+                    "away_team_id": int(away_id),
+                    "status":       status,
                 })
 
     return games
 
 
 def get_remaining_games(schedule_df: pd.DataFrame) -> pd.DataFrame:
-    """Filter schedule to only future (unplayed) games."""
-    if schedule_df.empty:
-        return schedule_df.copy()
+    """
+    Filter schedule to only future unplayed games.
+    Defensive: works whether or not status column is present or populated.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team_id", "away_team_id", "status"])
+
+    # Ensure status column exists
+    if "status" not in schedule_df.columns:
+        schedule_df = schedule_df.copy()
+        schedule_df["status"] = ""
+
     today = pd.Timestamp(date.today())
-    # Primary filter: game date is today or future
+
+    # Filter by date first
     future = schedule_df[schedule_df["game_date"] >= today].copy()
-    # Secondary filter: exclude games already completed if status column exists
-    # abstractGameState values: "Preview", "Live", "Final"
-    if "status" in future.columns:
-        completed = ["Final", "Game Over", "Completed Early"]
-        future = future[~future["status"].isin(completed)]
-    return future
+
+    # Then exclude games already completed
+    completed_states = {"Final", "Game Over", "Completed Early", "Postponed"}
+    future = future[~future["status"].isin(completed_states)]
+
+    return future.reset_index(drop=True)
 
 
 def compute_remaining_opponents(schedule_df: pd.DataFrame) -> dict[int, list[int]]:
     """
-    Returns dict mapping team_id → list of opponent team_ids for remaining games.
+    Returns dict mapping team_id -> list of opponent team_ids for remaining games.
     Used for strength-of-schedule calculations.
     """
     remaining = get_remaining_games(schedule_df)
     opponents: dict[int, list[int]] = {}
 
     for _, row in remaining.iterrows():
-        h, a = row["home_team_id"], row["away_team_id"]
+        h = int(row["home_team_id"])
+        a = int(row["away_team_id"])
         opponents.setdefault(h, []).append(a)
         opponents.setdefault(a, []).append(h)
 

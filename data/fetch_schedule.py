@@ -77,12 +77,15 @@ def _fetch_schedule_chunk(start: date, end: date) -> list[dict]:
             home_id = game.get("teams", {}).get("home", {}).get("team", {}).get("id")
             away_id = game.get("teams", {}).get("away", {}).get("team", {}).get("id")
             if home_id and away_id:
+                # Also capture detailed state for filtering
+                detail_state = game.get("status", {}).get("detailedState", "")
                 games.append({
                     "game_id":      game.get("gamePk"),
                     "game_date":    date_entry.get("date"),
                     "home_team_id": home_id,
                     "away_team_id": away_id,
-                    "status":       status,
+                    "status":       status or "",
+                    "detail_state": detail_state or "",
                 })
 
     return games
@@ -90,11 +93,17 @@ def _fetch_schedule_chunk(start: date, end: date) -> list[dict]:
 
 def get_remaining_games(schedule_df: pd.DataFrame) -> pd.DataFrame:
     """Filter schedule to only future (unplayed) games."""
+    if schedule_df.empty:
+        return schedule_df.copy()
     today = pd.Timestamp(date.today())
-    return schedule_df[
-        (schedule_df["game_date"] >= today) &
-        (schedule_df["status"].isin(["Preview", "Scheduled", ""]))
-    ].copy()
+    # Primary filter: game date is today or future
+    future = schedule_df[schedule_df["game_date"] >= today].copy()
+    # Secondary filter: exclude games already completed if status column exists
+    # abstractGameState values: "Preview", "Live", "Final"
+    if "status" in future.columns:
+        completed = ["Final", "Game Over", "Completed Early"]
+        future = future[~future["status"].isin(completed)]
+    return future
 
 
 def compute_remaining_opponents(schedule_df: pd.DataFrame) -> dict[int, list[int]]:
